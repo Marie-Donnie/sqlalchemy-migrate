@@ -6,7 +6,7 @@ from sqlalchemy.util import OrderedDict
 
 __all__ = ['databases', 'operations']
 
-databases = ('sqlite', 'postgres', 'mysql', 'oracle', 'mssql', 'firebird')
+databases = ('sqlite', 'postgres', 'mysql', 'oracle', 'mssql', 'firebird', 'cockroachdb')
 
 # Map operation names to function names
 operations = OrderedDict()

@@ -8,4 +8,5 @@ __all__ = [
     'mysql',
     'oracle',
     'ibmdb2',
+    'cockroachdb'
 ]
