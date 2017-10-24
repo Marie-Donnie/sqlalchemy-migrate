@@ -6,11 +6,6 @@
 from migrate.changeset.databases import postgres
 from sqlalchemy import schema
 
-from operator import attrgetter
-from sets import Set
-
-
-
 class CockroachColumnGenerator(postgres.PGColumnGenerator):
     """CockroachDB column generator implementation."""
     pass
@@ -29,9 +24,55 @@ class CockroachSchemaChanger(postgres.PGSchemaChanger):
 class CockroachConstraintGenerator(postgres.PGConstraintGenerator):
     """CockroachDB constraint generator (`create`) implementation.
 
+    The ADD CONSTRAINT statement add Check, Foreign Key and Unique
+    constraint to columns.
+
     See, https://www.cockroachlabs.com/docs/stable/add-constraint.html
 
     """
+    def visit_migrate_primary_key_constraint(self, constraint):
+        """Add the Primary Key constraint.
+
+        CockroachDB does not support the add of a Primary Key
+        constraint. To implement this migration, first make a new
+        temporary table with the new primary key and copy elements of
+        the original table. Then drop the original table and rename
+        the temporary one.
+
+        """
+        # CockroachDB does not support multiple primary keys, so we
+        # only consider the last column from the list of pks. Why the
+        # last one? why not!
+        pk_column = constraint.columns.values()[-1]
+        curr_table = constraint.table
+
+        # Build the temporary table
+        tmp_columns = [c.copy() for c in curr_table.columns]
+        for c in tmp_columns:
+            if c == pk_column:
+                c.primary_key = True
+            else:
+                c.primary_key = False
+
+        tmp_table = schema.Table(curr_table.name + '_migrate_tmp',
+                                 curr_table.metadata,
+                                 *tmp_columns)
+        tmp_table.create()
+
+        # Fill the temporary table with the original one
+        tmp_table.insert().from_select(
+            [c.name for c in curr_table.columns],
+            curr_table.select())
+
+        # Remove the original table and rename the temporary one
+        tname = self.preparer.format_table(curr_table)
+        tmp_tname = self.preparer.format_table(tmp_table)
+        self.append("DROP TABLE %s CASCADE" % tname)
+        self.execute()
+        self.append("ALTER TABLE %s  RENAME to %s" % (tmp_tname, tname))
+        self.execute()
+
+
     def visit_migrate_foreign_key_constraint(self, constraint):
         """Add the Foreign Key Constraint.
 
@@ -67,8 +108,19 @@ class CockroachConstraintGenerator(postgres.PGConstraintGenerator):
         super(CockroachConstraintGenerator, self).visit_migrate_foreign_key_constraint(constraint)
 
 class CockroachConstraintDropper(postgres.PGConstraintDropper):
-    """CockroachDB constaint dropper implementation."""
-    pass
+    """CockroachDB constraint dropper (`drop`) implementation.
+
+    The DROP CONSTRAINT statement removes Check and Foreign Key
+    constraints from columns.
+
+    See,
+    https://www.cockroachlabs.com/docs/stable/drop-constraint.html
+
+    """
+
+    def visit_migrate_primary_key_constraint(self, constraint):
+        """Do not drop constraint"""
+        pass
 
 
 class CockroachDialect(postgres.PGDialect):
