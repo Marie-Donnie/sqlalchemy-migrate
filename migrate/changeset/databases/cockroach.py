@@ -3,7 +3,7 @@
 
    .. _`CockroachDB`: http://www.postgresql.org/
 """
-from migrate.changeset.databases import postgres
+from ..databases import postgres
 
 import sqlalchemy
 from sqlalchemy.schema import DropConstraint
@@ -16,7 +16,7 @@ from cockroachdb.sqlalchemy.dialect import _type_map, CockroachDBDialect
 _type_map['bool'] = _type_map['boolean']
 
 class CockroachDDLCompiler(postgresql.PGDDLCompiler):
-    # Handle: sqlalchemy.Table(sqlalchemy.ForeignKey())
+    # Handle: sqlalchemy.Column(sqlalchemy.ForeignKey())
     def visit_foreign_key_constraint(self, constraint):
         # Only support ON DELETE/UPDATE RESTRICT.
         if constraint.ondelete:
@@ -32,13 +32,53 @@ CockroachDBDialect.ddl_compiler = CockroachDDLCompiler
 
 # -------------------------------------------- Handle migration
 class CockroachColumnGenerator(postgres.PGColumnGenerator):
-    """CockroachDB column generator implementation."""
-    pass
+    """CockroachDB column generator implementation.
+
+    ALTER TABLE ... ADD COLUMN
+    """
+    def add_foreignkey(self, fk):
+        from .visitor import get_engine_visitor, run_single_visitor
+
+        tname = fk.table.name
+        cnames = map(self.preparer.format_column, fk.columns.values())
+        fk.name = "%s_%s_fkey" % (tname, cnames[0])
+        fk.__migrate_visit_name__ = 'migrate_foreign_key_constraint'
+
+        engine = fk.table.metadata.bind
+        visitor = get_engine_visitor(engine, 'constraintgenerator')
+        run_single_visitor(engine, visitor, fk)
 
 
 class CockroachColumnDropper(postgres.PGColumnDropper):
-    """CockroachDB column dropper implementation."""
-    pass
+    """CockroachDB column dropper implementation.
+
+
+    ALTER TABLE ... DROP COLUMN
+    """
+    def visit_column(self, column):
+        """Drop a column from its table.
+
+        :param column: the column object
+        :type column: :class:`sqlalchemy.Column`
+        """
+        # Drop Constraint First
+        from .visitor import get_engine_visitor, run_single_visitor
+        engine = column.table.metadata.bind
+        visitor = get_engine_visitor(engine, 'constraintdropper')
+
+        for fk in column.foreign_keys:
+            fk.__migrate_visit_name__ = 'migrate_foreign_key_constraint'
+            run_single_visitor(engine, visitor, fk.constraint)
+
+        if column.primary_key:
+            pk = column.table.primary_key
+            pk.__migrate_visit_name__ = 'migrate_primary_key_constraint'
+            run_single_visitor(engine, visitor, pk)
+
+        # TODO: Drop CHECK/UNIQUE?
+
+        # Proceed
+        super(CockroachColumnDropper, self).visit_column(column)
 
 
 class CockroachSchemaChanger(postgres.PGSchemaChanger):
@@ -74,7 +114,7 @@ class CockroachConstraintGenerator(postgres.PGConstraintGenerator):
         # Build the temporary table
         tmp_columns = [c.copy() for c in curr_table.columns]
         for c in tmp_columns:
-            if c == pk_column:
+            if c.name == pk_column.name:
                 c.primary_key = True
             else:
                 c.primary_key = False
@@ -113,7 +153,6 @@ class CockroachConstraintGenerator(postgres.PGConstraintGenerator):
         https://www.cockroachlabs.com/docs/stable/add-constraint.html#add-the-foreign-key-constraint
         https://github.com/cockroachdb/cockroach/blob/4d587b1f19582c19b4c44c4fcc2b58efa38a57ed/pkg/sql/parser/sql.y#L2974
         """
-
         # Only support ON DELETE/UPDATE RESTRICT.
         if constraint.ondelete:
             constraint.ondelete = "RESTRICT"
@@ -126,11 +165,18 @@ class CockroachConstraintGenerator(postgres.PGConstraintGenerator):
         # Columns in the FK (have to be indexed)
         cnames = map(self.preparer.format_column, constraint.columns.values())
         # Index
-        self.append("CREATE INDEX ON %s (%s)" % (tname, ', '.join(cnames)))
+        self.append("CREATE INDEX cockroach_fk_%s ON %s (%s)" %
+                    ('_'.join(cnames), tname, ', '.join(cnames)))
         self.execute()
 
         # Proceed
         super(CockroachConstraintGenerator, self).visit_migrate_foreign_key_constraint(constraint)
+
+        # Validate the FK constraint
+        # See, https://github.com/cockroachdb/docs/issues/990
+        self.append("ALTER TABLE %s VALIDATE CONSTRAINT %s" %
+                    (tname, constraint.name))
+        self.execute()
 
 class CockroachConstraintDropper(postgres.PGConstraintDropper):
     """CockroachDB constraint dropper (`drop`) implementation.
@@ -152,10 +198,21 @@ class CockroachConstraintDropper(postgres.PGConstraintDropper):
         return closure
 
     def visit_migrate_foreign_key_constraint(self, constraint):
-        # TODO: Drop index created in
-        # CockroachConstraintGenerator::visit_migrate_foreign_key_constraint
-        pass
+        # First, drop fk
+        constraint.cascade = False
+        super(CockroachConstraintDropper, self).visit_migrate_foreign_key_constraint(constraint)
 
+        # Then, drop index created in
+        # CockroachConstraintGenerator::visit_migrate_foreign_key_constraint
+        #
+        # Table that has received a FK
+        tname = self.preparer.format_table(constraint.table)
+        # Columns in the FK (have been indexed)
+        cnames = map(self.preparer.format_column, constraint.columns.values())
+        # Drop Index
+        self.append("DROP INDEX %s@cockroach_fk_%s" %
+                    (tname, '_'.join(cnames)))
+        self.execute()
 
     def visit_migrate_primary_key_constraint(self, constraint):
         """Do not drop constraint"""
