@@ -9,7 +9,7 @@ from migrate.changeset.databases import (sqlite,
                                          mysql,
                                          oracle,
                                          firebird,
-                                         cockroachdb)
+                                         cockroach)
 
 
 # Map SA dialects to the corresponding Migrate extensions
@@ -21,7 +21,7 @@ DIALECTS = {
     "mysql": mysql.MySQLDialect,
     "oracle": oracle.OracleDialect,
     "firebird": firebird.FBDialect,
-    "cockroachdb": cockroachdb.CockroachDialect
+    "cockroachdb": cockroach.CockroachDialect
 }
 
 
