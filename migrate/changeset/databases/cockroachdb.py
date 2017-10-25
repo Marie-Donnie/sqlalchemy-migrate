@@ -4,7 +4,10 @@
    .. _`CockroachDB`: http://www.postgresql.org/
 """
 from migrate.changeset.databases import postgres
-from sqlalchemy import schema
+
+import sqlalchemy
+from sqlalchemy.schema import DropConstraint
+from sqlalchemy.engine import reflection
 
 class CockroachColumnGenerator(postgres.PGColumnGenerator):
     """CockroachDB column generator implementation."""
@@ -54,7 +57,7 @@ class CockroachConstraintGenerator(postgres.PGConstraintGenerator):
             else:
                 c.primary_key = False
 
-        tmp_table = schema.Table(curr_table.name + '_migrate_tmp',
+        tmp_table = sqlalchemy.Table(curr_table.name + '_migrate_tmp',
                                  curr_table.metadata,
                                  *tmp_columns)
         tmp_table.create()
@@ -117,11 +120,40 @@ class CockroachConstraintDropper(postgres.PGConstraintDropper):
     https://www.cockroachlabs.com/docs/stable/drop-constraint.html
 
     """
+    @staticmethod
+    def _to_index(table):
+        def closure(index_name):
+            idx = sqlalchemy.Index(index_name)
+            idx.table = table
+            return idx
+
+        return closure
+
+    def visit_migrate_foreign_key_constraint(self, constraint):
+        # TODO: Drop index created in
+        # CockroachConstraintGenerator::visit_migrate_foreign_key_constraint
+        pass
+
 
     def visit_migrate_primary_key_constraint(self, constraint):
         """Do not drop constraint"""
         pass
 
+    def visit_migrate_unique_constraint(self, constraint):
+        """Drop INDEX if the unique constraint is one"""
+        # Get indexes on that columns
+        insp = reflection.Inspector.from_engine(constraint.table.metadata.bind)
+        indexes = set([i['name']
+                       for i in insp.get_indexes(constraint.table)
+                       for c in i['column_names']
+                       if i['unique'] and c in constraint.columns])
+        indexes = map(CockroachConstraintDropper._to_index(constraint.table), indexes)
+
+        # Drop index if constraint is one or proceed
+        if indexes:
+            [i.drop() for i in indexes]
+        else:
+            super(CockroachConstraintDropper, self).visit_migrate_unique_constraint(constraint)
 
 class CockroachDialect(postgres.PGDialect):
     columngenerator = CockroachColumnGenerator
