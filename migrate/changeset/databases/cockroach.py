@@ -11,6 +11,7 @@ from sqlalchemy.schema import DropConstraint
 from sqlalchemy.engine import reflection
 from sqlalchemy.databases import postgresql
 
+import copy
 from operator import attrgetter
 
 def compose(f, g):
@@ -133,8 +134,79 @@ class CockroachColumnDropper(postgres.PGColumnDropper, CockroachAlterTableVisito
 
 
 class CockroachSchemaChanger(postgres.PGSchemaChanger, CockroachAlterTableVisitor):
-    """CockroachDB schema changer implementation."""
-    pass
+    """CockroachDB schema changer implementation.
+
+    ALTER TABLE ... ALTER COLUMN ...
+
+    See, https://www.cockroachlabs.com/docs/stable/alter-column.html
+    """
+    @staticmethod
+    def copy_delta(delta, key):
+        "Copies ColumnDelta `delta` and only keeps the key modification."
+        to_remove_keys = filter(
+            key.__ne__, ['name', 'type', 'primary_key', 'nullable',
+                         'server_onupdate', 'server_default',
+                         'autoincrement'])
+
+        delta_ = copy.copy(delta)
+        delta_.diffs = delta.diffs.copy()
+
+        for k in to_remove_keys:
+            delta_.diffs.pop(k, False)
+
+        return delta_
+
+    def visit_column(self, delta):
+        """Rename/change a column."""
+        # ALTER COLUMN is implemented as several ALTER statements
+        table = self._to_table(delta.table)
+        column = delta.result_column
+        alter_type = delta.keys()
+
+        # ALTER COLUMN ... SET NOT NULL not implemented by
+        # CockroachDB. Only do nullable if it's a SET NULL.
+        set_null = delta.get('nullable', False)
+        if set_null:
+            super(CockroachSchemaChanger, self).visit_column(
+                CockroachSchemaChanger.copy_delta(delta, 'nullable'))
+
+        # ALTER COLUMN ... TYPE <type> is not implemented by
+        # CockroachDB. Go through a temp table to implement it.
+        the_type = delta.get('type', False)
+        if the_type:
+            self._visit_column_type(table, column, the_type)
+
+        # ALTER COLUMN ... SET/DROP DEFAULT is well implemented in
+        # CockroachDB. Fallback to ANSISQL implementation.
+        default = delta.get('server_default', False)
+        if default:
+            super(CockroachSchemaChanger, self).visit_column(
+                CockroachSchemaChanger.copy_delta(delta, 'server_default'))
+
+        # ALTER COLUMN ... RENAME COLUMN ... TO ... is well
+        # implemented in CockroachDB. Fallback to ANSISQL
+        # implementation.
+        rename = delta.get('name', False)
+        if rename:
+            super(CockroachSchemaChanger, self).visit_column(
+                CockroachSchemaChanger.copy_delta(delta, 'name'))
+
+    def _visit_column_type(self, table, column, the_type):
+        """ALTER COLUMN ... TYPE <type>
+
+        Not implemented by CockroachDB. To implement this migration,
+        first make a new temporary table with the new type and copy
+        elements of the original table. Then drop the original table
+        and rename the temporary one.
+
+        """
+        def set_column_type(table):
+            for col in filter(compose(column.name.__eq__, attrgetter('name')),
+                              table.columns):
+                col.type = the_type
+
+        # Recreates the table by changing the type of the column
+        self.recreate_table(table, set_column_type)
 
 
 class CockroachConstraintGenerator(postgres.PGConstraintGenerator, CockroachAlterTableVisitor):
