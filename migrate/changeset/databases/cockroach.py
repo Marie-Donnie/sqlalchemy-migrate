@@ -34,6 +34,23 @@ class CockroachDDLCompiler(postgresql.PGDDLCompiler):
 
         super(CockroachDDLCompiler, self).visit_foreign_key_constraint(constraint)
 
+    def visit_drop_index(self, drop):
+        """DROP INDEX ...
+
+        CockroachDB doesn't support the drop of table's `primary`
+        index. This workaround passes the drop and doesn't delete the
+        index if it's primary one.
+
+        See, https://www.cockroachlabs.com/docs/stable/drop-index.html
+
+        """
+        index = drop.element
+
+        if index.name == 'primary':
+            return "SELECT 1"
+        else:
+            return super(CockroachDDLCompiler, self).visit_drop_index(drop)
+
 
 CockroachDBDialect.ddl_compiler = CockroachDDLCompiler
 
