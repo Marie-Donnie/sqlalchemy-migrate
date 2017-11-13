@@ -3,12 +3,18 @@
 
    .. _`CockroachDB`: http://www.postgresql.org/
 """
+from .. import ansisql
 from ..databases import postgres
 
 import sqlalchemy
 from sqlalchemy.schema import DropConstraint
 from sqlalchemy.engine import reflection
 from sqlalchemy.databases import postgresql
+
+from operator import attrgetter
+
+def compose(f, g):
+    return lambda x: f(g(x))
 
 # ------------------------------------------- CockroachDB Dialects Workaround
 # CockroachDB Dialect misses BOOL type name
@@ -17,6 +23,7 @@ _type_map['bool'] = _type_map['boolean']
 
 class CockroachDDLCompiler(postgresql.PGDDLCompiler):
     # Handle: sqlalchemy.Column(sqlalchemy.ForeignKey())
+    # See, https://github.com/zzzeek/sqlalchemy/blob/6448903b5287801aaefbf82b5fa108403d743e8f/lib/sqlalchemy/sql/compiler.py#L2673
     def visit_foreign_key_constraint(self, constraint):
         # Only support ON DELETE/UPDATE RESTRICT.
         if constraint.ondelete:
@@ -31,7 +38,51 @@ CockroachDBDialect.ddl_compiler = CockroachDDLCompiler
 
 
 # -------------------------------------------- Handle migration
-class CockroachColumnGenerator(postgres.PGColumnGenerator):
+class CockroachAlterTableVisitor(ansisql.AlterTableVisitor):
+    def clean_context(self, l):
+        self.buffer.seek(0)
+        self.buffer.truncate()
+        l();
+        self.append("SELECT 1")
+
+    def recreate_table(self, table, effects):
+        """Recreates a table with some modifications.
+
+        Make a new temporary table, applies `effects` and copy
+        elements of the original table. Then drop the original table
+        and rename the temporary one.
+
+        The `effects` function takes the SQLAlchemy::Table object in
+        parameter, so the `effects` function can change it before the
+        table creation.
+
+        """
+        # Build the temporary table
+        curr_table = table
+        tmp_columns = [c.copy() for c in curr_table.columns]
+        tmp_table = sqlalchemy.Table(curr_table.name + '_migrate_tmp',
+                                     sqlalchemy.MetaData(bind=curr_table.metadata.bind),
+                                     *tmp_columns)
+
+        # Apply custom effects on the tmp_table and create it
+        effects(tmp_table)
+        tmp_table.create()
+
+        # Fill the temporary table with the original one
+        tmp_table.insert().from_select(
+            [c.name for c in curr_table.columns],
+            curr_table.select())
+
+        # Remove the original table and rename the temporary one
+        tname = self.preparer.format_table(curr_table)
+        tmp_tname = self.preparer.format_table(tmp_table)
+        self.append("DROP TABLE %s CASCADE" % tname)
+        self.execute()
+        self.append("ALTER TABLE %s RENAME TO %s" % (tmp_tname, tname))
+        self.execute()
+
+
+class CockroachColumnGenerator(postgres.PGColumnGenerator, CockroachAlterTableVisitor):
     """CockroachDB column generator implementation.
 
     ALTER TABLE ... ADD COLUMN
@@ -49,7 +100,7 @@ class CockroachColumnGenerator(postgres.PGColumnGenerator):
         run_single_visitor(engine, visitor, fk)
 
 
-class CockroachColumnDropper(postgres.PGColumnDropper):
+class CockroachColumnDropper(postgres.PGColumnDropper, CockroachAlterTableVisitor):
     """CockroachDB column dropper implementation.
 
 
@@ -81,12 +132,12 @@ class CockroachColumnDropper(postgres.PGColumnDropper):
         super(CockroachColumnDropper, self).visit_column(column)
 
 
-class CockroachSchemaChanger(postgres.PGSchemaChanger):
+class CockroachSchemaChanger(postgres.PGSchemaChanger, CockroachAlterTableVisitor):
     """CockroachDB schema changer implementation."""
     pass
 
 
-class CockroachConstraintGenerator(postgres.PGConstraintGenerator):
+class CockroachConstraintGenerator(postgres.PGConstraintGenerator, CockroachAlterTableVisitor):
     """CockroachDB constraint generator (`create`) implementation.
 
     The ADD CONSTRAINT statement add Check, Foreign Key and Unique
@@ -105,37 +156,16 @@ class CockroachConstraintGenerator(postgres.PGConstraintGenerator):
         the temporary one.
 
         """
-        # CockroachDB does not support multiple primary keys, so we
-        # only consider the last column from the list of pks. Why the
-        # last one? why not!
-        pk_column = constraint.columns.values()[-1]
-        curr_table = constraint.table
+        pk_names = map(attrgetter('name'), constraint.columns.values())
+        def set_primary_keys(table):
+            for col in table.columns:
+                if col.name in pk_names:
+                    col.primary_key = True
+                else:
+                    col.primary_key = False
 
-        # Build the temporary table
-        tmp_columns = [c.copy() for c in curr_table.columns]
-        for c in tmp_columns:
-            if c.name == pk_column.name:
-                c.primary_key = True
-            else:
-                c.primary_key = False
-
-        tmp_table = sqlalchemy.Table(curr_table.name + '_migrate_tmp',
-                                 curr_table.metadata,
-                                 *tmp_columns)
-        tmp_table.create()
-
-        # Fill the temporary table with the original one
-        tmp_table.insert().from_select(
-            [c.name for c in curr_table.columns],
-            curr_table.select())
-
-        # Remove the original table and rename the temporary one
-        tname = self.preparer.format_table(curr_table)
-        tmp_tname = self.preparer.format_table(tmp_table)
-        self.append("DROP TABLE %s CASCADE" % tname)
-        self.execute()
-        self.append("ALTER TABLE %s  RENAME to %s" % (tmp_tname, tname))
-        self.execute()
+        # Recreates the table by changing the type of the column
+        self.recreate_table(constraint.table, set_primary_keys)
 
 
     def visit_migrate_foreign_key_constraint(self, constraint):
@@ -178,7 +208,7 @@ class CockroachConstraintGenerator(postgres.PGConstraintGenerator):
                     (tname, constraint.name))
         self.execute()
 
-class CockroachConstraintDropper(postgres.PGConstraintDropper):
+class CockroachConstraintDropper(postgres.PGConstraintDropper, CockroachAlterTableVisitor):
     """CockroachDB constraint dropper (`drop`) implementation.
 
     The DROP CONSTRAINT statement removes Check and Foreign Key
