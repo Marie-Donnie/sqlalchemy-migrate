@@ -349,7 +349,9 @@ class CockroachConstraintDropper(postgres.PGConstraintDropper, CockroachAlterTab
 
         # Drop index if constraint is one or proceed
         if indexes:
-            [i.drop() for i in indexes]
+           for i in indexes:
+               self.append("DROP INDEX %s CASCADE" % self._prepared_index_name(i))
+               self.execute()
         else:
             super(CockroachConstraintDropper, self).visit_migrate_unique_constraint(constraint)
 
